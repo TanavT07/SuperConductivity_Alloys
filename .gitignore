@@ -1,14 +1,45 @@
-# Python-generated files
+# Python bytecode & packaging
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
 build/
 dist/
 wheels/
-*.egg-info
-*.csv
-*.joblib
-deployment/
-.env
+*.egg-info/
 
-# Virtual environments
-.venv
+# Environments & secrets
+.venv/
+env/
+venv/
+.env
+.env.*
+!.env.example
+
+# Serialized model weights (large binaries re-generated on boot)
+*.joblib
+src/alloy_opt/deployment/*.joblib
+
+# Ignore runtime CSV states, but whitelist seed data
+*.csv
+!unlabeled_pool.csv
+!labeled_pool.csv
+!src/alloy_opt/unlabeled_pool.csv
+!src/alloy_opt/labeled_pool.csv
+!src/alloy_opt/deployment/X_train_state.csv
+!src/alloy_opt/deployment/y_train_state.csv
+
+# Frontend (Node / Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
