@@ -3,19 +3,20 @@ import math
 import os
 import re
 import sys
+import urllib.request
+import zipfile
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
-import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sklearn.neighbors import KDTree
 
-# Guarantee local module resolution regardless of where uvicorn is invoked
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
@@ -30,11 +31,15 @@ except ImportError:
 
 DEPLOY_DIR = os.path.join(BASE_DIR, "deployment")
 UNLABELED_POOL_PATH = os.path.join(BASE_DIR, "unlabeled_pool.csv")
+LABELED_POOL_PATH = os.path.join(BASE_DIR, "labeled_pool.csv")
+TRAIN_FORMULAS_PATH = os.path.join(DEPLOY_DIR, "train_formulas_state.csv")
+
+UCI_ZIP_URL = "https://archive.ics.uci.edu/static/public/464/superconductivty+data.zip"
 
 app_state: Dict[str, Any] = {}
 
 
-# --- Pydantic Schemas (1:1 Match with frontend/src/types/materials.ts) ---
+# --- Pydantic Schemas ---
 
 class CandidateSchema(BaseModel):
     id: int
@@ -120,6 +125,16 @@ def _clean_float(val: Any, default: float = 0.0, digits: int = 4) -> float:
         return default
 
 
+def _load_y_series(csv_path: str) -> pd.Series:
+    df = pd.read_csv(csv_path, index_col=0)
+    col_name = str(df.columns[0]) if len(df.columns) > 0 else "critical_temp"
+    return pd.Series(df.iloc[:, 0].to_numpy(dtype=float), index=df.index, name=col_name)
+
+
+def _normalize_formula(formula: str) -> str:
+    return re.sub(r"(?<=[A-Za-z])1(?=[A-Z]|$)", "", str(formula).strip())
+
+
 def _extract_elements(formula: str) -> List[str]:
     seen: List[str] = []
     for token in re.findall(r"[A-Z][a-z]*", str(formula)):
@@ -128,10 +143,135 @@ def _extract_elements(formula: str) -> List[str]:
     return seen if seen else ["Y", "Ba", "Cu", "O"]
 
 
-def _recompute_pool_and_metrics() -> None:
+def _auto_inject_real_uci_formulas(
+    unlab_df: pd.DataFrame,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    print(
+        f"[Formula Auto-Align] Detected only {unlab_df['chemical_formulas'].nunique()} unique placeholder "
+        f"formulas across {len(unlab_df)} rows. Downloading official UCI unique_m.csv archive..."
+    )
+    req = urllib.request.Request(UCI_ZIP_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        zip_bytes = resp.read()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        with zf.open("train.csv") as f_tr, zf.open("unique_m.csv") as f_unq:
+            ref_train = pd.read_csv(f_tr)
+            ref_unique = pd.read_csv(f_unq)
+
+    ref_formulas = np.array([_normalize_formula(m) for m in ref_unique["material"]], dtype=object)
+
+    def _match_df(target_df: pd.DataFrame) -> List[str]:
+        cols = [c for c in feature_cols if c in target_df.columns and c in ref_train.columns]
+        if "critical_temp" in target_df.columns and "critical_temp" in ref_train.columns:
+            cols.append("critical_temp")
+
+        ref_mat = ref_train[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        tgt_mat = target_df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+
+        means = np.mean(ref_mat, axis=0)
+        stds = np.where(np.std(ref_mat, axis=0) < 1e-12, 1.0, np.std(ref_mat, axis=0))
+
+        tree = KDTree((ref_mat - means) / stds)
+        _, idx = tree.query((tgt_mat - means) / stds, k=1)
+        return [str(ref_formulas[int(i)]) for i in idx[:, 0]]
+
+    unlab_df["chemical_formulas"] = _match_df(unlab_df)
+    unlab_df.to_csv(UNLABELED_POOL_PATH, index=False)
+
+    if os.path.exists(LABELED_POOL_PATH):
+        lab_df = pd.read_csv(LABELED_POOL_PATH)
+        lab_df["chemical_formulas"] = _match_df(lab_df)
+        lab_df.to_csv(LABELED_POOL_PATH, index=False)
+
+    temp_train = X_train.copy()
+    if len(y_train) == len(temp_train):
+        temp_train["critical_temp"] = y_train.to_numpy(dtype=float)
+    train_formulas = _match_df(temp_train)
+    pd.DataFrame(
+        {
+            "chemical_formulas": train_formulas,
+            "critical_temp": temp_train["critical_temp"].to_numpy(dtype=float)
+            if "critical_temp" in temp_train.columns
+            else np.zeros(len(X_train)),
+        },
+        index=X_train.index,
+    ).to_csv(TRAIN_FORMULAS_PATH)
+
+    return unlab_df
+
+
+def _rank_candidates_by_ucb(kappa: float = 1.96) -> None:
     """
-    Vectorized GP evaluation over the unlabeled pool and training metrics computation.
-    Caches top-ranked candidates and analytics in `app_state` so GET requests take <2ms.
+    Fast (<3 ms) UCB re-ranking using the cached GP posterior (pool_mu, pool_std).
+    Allows changing `kappa` from the frontend Settings slider without re-running
+    GP inference or permutation importances.
+    """
+    unlab_df: pd.DataFrame = app_state["unlabelled"]
+    feature_cols: List[str] = app_state["feature_cols"]
+    mu: Optional[np.ndarray] = app_state.get("pool_mu")
+    std: Optional[np.ndarray] = app_state.get("pool_std")
+    norm_uncertainty: Optional[np.ndarray] = app_state.get("pool_norm_uncertainty")
+    preview_matrix: Optional[np.ndarray] = app_state.get("pool_preview_matrix")
+
+    if unlab_df.empty or mu is None or std is None or norm_uncertainty is None or preview_matrix is None:
+        app_state["cached_candidates"] = []
+        return
+
+    ucb = mu + float(kappa) * std
+    sorted_positions = np.argsort(ucb)[::-1]
+
+    preview_cols = feature_cols[:8]
+    formulas = unlab_df["chemical_formulas"].fillna("Unknown").astype(str).to_numpy()
+    statuses = (
+        unlab_df["status"].fillna("unlabeled").astype(str).to_numpy()
+        if "status" in unlab_df.columns
+        else np.full(len(unlab_df), "unlabeled")
+    )
+    df_indices = unlab_df.index.to_numpy()
+
+    deduplicate_by_formula = unlab_df["chemical_formulas"].nunique() > 100
+    ranked_candidates: List[Dict[str, Any]] = []
+    seen_formulas: set[str] = set()
+    target_limit = 500
+
+    for pos in sorted_positions:
+        f_str = _normalize_formula(formulas[pos])
+        if deduplicate_by_formula:
+            if not f_str or f_str in seen_formulas:
+                continue
+            seen_formulas.add(f_str)
+
+        row_features = {
+            col: _clean_float(preview_matrix[pos, c_idx], 0.0, 3)
+            for c_idx, col in enumerate(preview_cols)
+        }
+        status_str = str(statuses[pos])
+        if status_str.lower() == "nan" or not status_str.strip():
+            status_str = "unlabeled"
+
+        ranked_candidates.append({
+            "id": int(df_indices[pos]),
+            "formula": f_str,
+            "predicted_tc": _clean_float(mu[pos], 0.0, 2),
+            "uncertainty": _clean_float(norm_uncertainty[pos], 0.1, 4),
+            "ucb_score": _clean_float(ucb[pos], 0.0, 3),
+            "status": status_str,
+            "features": row_features,
+        })
+        if len(ranked_candidates) >= target_limit:
+            break
+
+    app_state["cached_candidates"] = ranked_candidates
+
+
+def _recompute_pool_and_metrics(kappa: float = 1.96) -> None:
+    """
+    Full GP evaluation across the unlabeled pool plus training diagnostics and
+    pipeline permutation importances. Caches posterior arrays for fast kappa updates.
     """
     engine: ActiveLearningEngine = app_state["Engine"]
     unlab_df: pd.DataFrame = app_state["unlabelled"]
@@ -143,7 +283,6 @@ def _recompute_pool_and_metrics() -> None:
         app_state["cached_candidates"] = []
         return
 
-    # Strictly align unlabeled pool columns to the trained feature matrix
     X_pool = (
         unlab_df.reindex(columns=feature_cols, fill_value=0.0)
         .apply(pd.to_numeric, errors="coerce")
@@ -151,69 +290,39 @@ def _recompute_pool_and_metrics() -> None:
     )
 
     try:
-        X_scaled = engine.scaler.transform(X_pool)
-        raw_mu, raw_std = engine.gp.predict(X_scaled, return_std=True)
+        raw_mu, raw_std = engine.predict(X_pool, return_std=True)
     except Exception as exc:
-        print(f"[GP Evaluation Warning] Refitting engine on current training state: {exc}")
+        print(f"[GP Evaluation Notice] Refitting PLS+GP pipeline on current training state: {exc}")
         engine.Fit(X_train, y_train)
-        X_scaled = engine.scaler.transform(X_pool)
-        raw_mu, raw_std = engine.gp.predict(X_scaled, return_std=True)
+        engine.save_state(DEPLOY_DIR)
+        raw_mu, raw_std = engine.predict(X_pool, return_std=True)
 
-    # Clamp predicted critical temperatures to physical superconducting bounds [0, 200] K
     mu = np.clip(np.nan_to_num(raw_mu, nan=0.0, posinf=150.0, neginf=0.0), 0.0, 200.0)
     std = np.clip(np.nan_to_num(raw_std, nan=0.1, posinf=10.0, neginf=0.01), 1e-4, None)
-    ucb = mu + 1.96 * std
 
-    # Normalize uncertainty to [0.03, 0.82] to match PhaseSpacePlot YAxis domain [0, 0.85]
-    # and CandidateRankingTable percentage bar (uncertainty * 100%)
     std_min, std_max = float(np.min(std)), float(np.max(std))
     if std_max - std_min > 1e-6:
         norm_uncertainty = 0.05 + ((std - std_min) / (std_max - std_min)) * 0.75
     else:
         norm_uncertainty = np.full_like(std, 0.25)
 
-    # Sort indices descending by UCB score and materialize the top 250 candidates
-    top_k = min(250, len(unlab_df))
-    top_positions = np.argsort(ucb)[::-1][:top_k]
-
     preview_cols = feature_cols[:8]
-    preview_matrix = X_pool[preview_cols].to_numpy(dtype=float)
-    formulas = unlab_df["chemical_formulas"].astype(str).to_numpy()
-    statuses = (
-        unlab_df["status"].astype(str).to_numpy()
-        if "status" in unlab_df.columns
-        else np.full(len(unlab_df), "unlabeled")
-    )
-    df_indices = unlab_df.index.to_numpy()
+    app_state["pool_mu"] = mu
+    app_state["pool_std"] = std
+    app_state["pool_norm_uncertainty"] = norm_uncertainty
+    app_state["pool_preview_matrix"] = X_pool[preview_cols].to_numpy(dtype=float)
 
-    ranked_candidates: List[Dict[str, Any]] = []
-    for pos in top_positions:
-        row_features = {
-            col: _clean_float(preview_matrix[pos, c_idx], 0.0, 3)
-            for c_idx, col in enumerate(preview_cols)
-        }
-        ranked_candidates.append({
-            "id": int(df_indices[pos]),
-            "formula": str(formulas[pos]),
-            "predicted_tc": _clean_float(mu[pos], 0.0, 2),
-            "uncertainty": _clean_float(norm_uncertainty[pos], 0.1, 4),
-            "ucb_score": _clean_float(ucb[pos], 0.0, 3),
-            "status": str(statuses[pos]),
-            "features": row_features,
-        })
+    _rank_candidates_by_ucb(kappa=kappa)
 
-    app_state["cached_candidates"] = ranked_candidates
-
-    # Compute training diagnostics and permutation feature importances for /analytics
+    # Compute GP training diagnostics and permutation importances across the full pipeline
     try:
         X_train_aligned = (
             X_train.reindex(columns=feature_cols, fill_value=0.0)
             .apply(pd.to_numeric, errors="coerce")
             .fillna(0.0)
         )
-        X_train_scaled = engine.scaler.transform(X_train_aligned)
-        train_pred = engine.gp.predict(X_train_scaled)
-        residuals = np.asarray(y_train, dtype=float) - train_pred
+        train_pred = engine.predict(X_train_aligned, return_std=False)
+        residuals = np.asarray(y_train, dtype=float) - np.asarray(train_pred, dtype=float)
         mae = _clean_float(np.mean(np.abs(residuals)), 0.0, 3)
         rmse = _clean_float(np.sqrt(np.mean(residuals ** 2)), 0.0, 3)
 
@@ -238,8 +347,10 @@ def _recompute_pool_and_metrics() -> None:
             for i, col in enumerate(feature_cols[:8])
         ]
 
-    # Extract learned Matern kernel hyperparameters
-    kernel_params: Dict[str, float] = {"alpha": _clean_float(getattr(engine.gp, "alpha", 0.01), 0.01, 5)}
+    kernel_params: Dict[str, float] = {
+        "alpha": _clean_float(getattr(engine.gp, "alpha", 0.01), 0.01, 5),
+        "pls_components": float(getattr(engine.pls, "actual_components_", 15)),
+    }
     raw_k_params = getattr(engine.gp, "kernel_", engine.gp.kernel).get_params()
     for k, v in raw_k_params.items():
         if isinstance(v, (int, float, np.floating, np.integer)):
@@ -257,21 +368,55 @@ def _recompute_pool_and_metrics() -> None:
 
 
 def _build_synthetic_polymorphs(formula: str) -> List[Dict[str, Any]]:
-    """
-    Constructs chemically realistic 3D unit cells using the exact elements of `formula`
-    so CrystalViewer3D.tsx and PolymorphSelector.tsx always render multi-polymorph structures.
-    """
     elements = _extract_elements(formula)
     seed = abs(hash(formula)) % 80000 + 10000
 
-    # Binary compound (e.g., MgB2, Nb3Ge, FeSe)
+    if len(elements) == 1:
+        el = elements[0]
+        a_bcc, a_fcc = 3.30, 4.05
+        return [
+            {
+                "mp_id": f"mp-{seed}",
+                "formula": formula,
+                "space_group": {"number": 229, "symbol": "Im-3m"},
+                "crystal_system": "cubic",
+                "energy_above_hull": 0.0,
+                "formation_energy_per_atom": 0.0,
+                "lattice": {
+                    "a": a_bcc, "b": a_bcc, "c": a_bcc,
+                    "alpha": 90.0, "beta": 90.0, "gamma": 90.0,
+                    "volume": _clean_float(a_bcc ** 3, 35.94, 2),
+                },
+                "sites": [
+                    {"element": el, "coords": [0.0, 0.0, 0.0], "label": f"{el}1"},
+                    {"element": el, "coords": [0.5, 0.5, 0.5], "label": f"{el}2"},
+                ],
+            },
+            {
+                "mp_id": f"mp-{seed + 1}",
+                "formula": formula,
+                "space_group": {"number": 225, "symbol": "Fm-3m"},
+                "crystal_system": "cubic",
+                "energy_above_hull": 0.032,
+                "formation_energy_per_atom": 0.032,
+                "lattice": {
+                    "a": a_fcc, "b": a_fcc, "c": a_fcc,
+                    "alpha": 90.0, "beta": 90.0, "gamma": 90.0,
+                    "volume": _clean_float(a_fcc ** 3, 66.43, 2),
+                },
+                "sites": [
+                    {"element": el, "coords": [0.0, 0.0, 0.0], "label": f"{el}1"},
+                    {"element": el, "coords": [0.0, 0.5, 0.5], "label": f"{el}2"},
+                    {"element": el, "coords": [0.5, 0.0, 0.5], "label": f"{el}3"},
+                    {"element": el, "coords": [0.5, 0.5, 0.0], "label": f"{el}4"},
+                ],
+            },
+        ]
+
     if len(elements) == 2:
         el_a, el_b = elements[0], elements[1]
         a_tet, c_tet = 3.82, 6.28
-        vol_tet = _clean_float(a_tet * a_tet * c_tet, 91.6, 2)
         a_cub = 4.92
-        vol_cub = _clean_float(a_cub ** 3, 119.1, 2)
-
         return [
             {
                 "mp_id": f"mp-{seed}",
@@ -283,7 +428,7 @@ def _build_synthetic_polymorphs(formula: str) -> List[Dict[str, Any]]:
                 "lattice": {
                     "a": a_tet, "b": a_tet, "c": c_tet,
                     "alpha": 90.0, "beta": 90.0, "gamma": 90.0,
-                    "volume": vol_tet,
+                    "volume": _clean_float(a_tet * a_tet * c_tet, 91.6, 2),
                 },
                 "sites": [
                     {"element": el_a, "coords": [0.0, 0.0, 0.0], "label": f"{el_a}1"},
@@ -302,7 +447,7 @@ def _build_synthetic_polymorphs(formula: str) -> List[Dict[str, Any]]:
                 "lattice": {
                     "a": a_cub, "b": a_cub, "c": a_cub,
                     "alpha": 90.0, "beta": 90.0, "gamma": 90.0,
-                    "volume": vol_cub,
+                    "volume": _clean_float(a_cub ** 3, 119.1, 2),
                 },
                 "sites": [
                     {"element": el_b, "coords": [0.0, 0.0, 0.0], "label": f"{el_b}1"},
@@ -315,34 +460,53 @@ def _build_synthetic_polymorphs(formula: str) -> List[Dict[str, Any]]:
             },
         ]
 
-    # Multi-element layered perovskite / cuprate / pnictide
-    e0 = elements[0]
-    e1 = elements[1 % len(elements)]
-    e2 = elements[2 % len(elements)]
+    cations = elements[:-1]
     e_anion = elements[-1]
 
-    a_t, b_t, c_t = 3.85, 3.85, 11.68
-    vol_t = _clean_float(a_t * b_t * c_t, 173.13, 2)
+    cation_positions: List[List[float]] = [
+        [0.5, 0.5, 0.50],
+        [0.5, 0.5, 0.18],
+        [0.5, 0.5, 0.82],
+        [0.0, 0.0, 0.00],
+        [0.0, 0.0, 0.35],
+        [0.0, 0.0, 0.65],
+        [0.5, 0.5, 0.00],
+        [0.0, 0.0, 0.50],
+    ]
+
+    layered_sites: List[Dict[str, Any]] = []
+    elem_counts: Dict[str, int] = {}
+
+    num_cation_slots = max(6, len(cations))
+    for i in range(min(num_cation_slots, len(cation_positions))):
+        el = cations[i % len(cations)]
+        elem_counts[el] = elem_counts.get(el, 0) + 1
+        layered_sites.append({
+            "element": el,
+            "coords": cation_positions[i],
+            "label": f"{el}{elem_counts[el]}",
+        })
+
+    anion_positions: List[List[float]] = [
+        [0.5, 0.0, 0.00],
+        [0.0, 0.5, 0.00],
+        [0.5, 0.0, 0.35],
+        [0.0, 0.5, 0.35],
+        [0.5, 0.0, 0.65],
+        [0.0, 0.5, 0.65],
+        [0.0, 0.0, 0.16],
+        [0.0, 0.0, 0.84],
+    ]
+    for pos in anion_positions:
+        elem_counts[e_anion] = elem_counts.get(e_anion, 0) + 1
+        layered_sites.append({
+            "element": e_anion,
+            "coords": pos,
+            "label": f"{e_anion}{elem_counts[e_anion]}",
+        })
 
     a_o, b_o, c_o = 3.82, 3.89, 11.68
-    vol_o = _clean_float(a_o * b_o * c_o, 173.56, 2)
-
-    layered_sites = [
-        {"element": e0, "coords": [0.5, 0.5, 0.50], "label": f"{e0}1"},
-        {"element": e1, "coords": [0.5, 0.5, 0.18], "label": f"{e1}1"},
-        {"element": e1, "coords": [0.5, 0.5, 0.82], "label": f"{e1}2"},
-        {"element": e2, "coords": [0.0, 0.0, 0.00], "label": f"{e2}1"},
-        {"element": e2, "coords": [0.0, 0.0, 0.35], "label": f"{e2}2"},
-        {"element": e2, "coords": [0.0, 0.0, 0.65], "label": f"{e2}3"},
-        {"element": e_anion, "coords": [0.5, 0.0, 0.00], "label": f"{e_anion}1"},
-        {"element": e_anion, "coords": [0.0, 0.5, 0.00], "label": f"{e_anion}2"},
-        {"element": e_anion, "coords": [0.5, 0.0, 0.35], "label": f"{e_anion}3"},
-        {"element": e_anion, "coords": [0.0, 0.5, 0.35], "label": f"{e_anion}4"},
-        {"element": e_anion, "coords": [0.5, 0.0, 0.65], "label": f"{e_anion}5"},
-        {"element": e_anion, "coords": [0.0, 0.5, 0.65], "label": f"{e_anion}6"},
-        {"element": e_anion, "coords": [0.0, 0.0, 0.16], "label": f"{e_anion}7"},
-        {"element": e_anion, "coords": [0.0, 0.0, 0.84], "label": f"{e_anion}8"},
-    ]
+    a_t, b_t, c_t = 3.85, 3.85, 11.68
 
     return [
         {
@@ -355,7 +519,7 @@ def _build_synthetic_polymorphs(formula: str) -> List[Dict[str, Any]]:
             "lattice": {
                 "a": a_o, "b": b_o, "c": c_o,
                 "alpha": 90.0, "beta": 90.0, "gamma": 90.0,
-                "volume": vol_o,
+                "volume": _clean_float(a_o * b_o * c_o, 173.56, 2),
             },
             "sites": layered_sites,
         },
@@ -369,7 +533,7 @@ def _build_synthetic_polymorphs(formula: str) -> List[Dict[str, Any]]:
             "lattice": {
                 "a": a_t, "b": b_t, "c": c_t,
                 "alpha": 90.0, "beta": 90.0, "gamma": 90.0,
-                "volume": vol_t,
+                "volume": _clean_float(a_t * b_t * c_t, 173.13, 2),
             },
             "sites": layered_sites,
         },
@@ -383,21 +547,27 @@ async def lifespan(app: FastAPI):
     print("Initializing Superconductor Digital Triage Workbench backend...")
     os.makedirs(DEPLOY_DIR, exist_ok=True)
 
-    engine = ActiveLearningEngine()
-    gp_path = os.path.join(DEPLOY_DIR, "gaussian_process.joblib")
-    scaler_path = os.path.join(DEPLOY_DIR, "standard_scaler.joblib")
+    engine = ActiveLearningEngine(n_components=15)
     x_train_path = os.path.join(DEPLOY_DIR, "X_train_state.csv")
     y_train_path = os.path.join(DEPLOY_DIR, "y_train_state.csv")
 
     X_train = pd.read_csv(x_train_path, index_col=0)
-    y_train = pd.read_csv(y_train_path, index_col=0).squeeze("columns")
-    feature_cols = [str(col) for col in X_train.columns]
+    y_train = _load_y_series(y_train_path)
 
-    if os.path.exists(gp_path) and os.path.exists(scaler_path):
-        engine.gp = joblib.load(gp_path)
-        engine.scaler = joblib.load(scaler_path)
-    else:
-        engine.Fit(X_train, y_train)
+    # Guard against row count mismatch if a previous process was interrupted mid-save
+    min_len = min(len(X_train), len(y_train))
+    X_train = X_train.iloc[:min_len].copy()
+    y_train = y_train.iloc[:min_len].copy()
+
+    feature_cols = [str(col) for col in X_train.columns]
+    X_train_clean = (
+        X_train.reindex(columns=feature_cols, fill_value=0.0)
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
+
+    if not engine.load_state(DEPLOY_DIR, expected_features=len(feature_cols)):
+        engine.Fit(X_train_clean, y_train)
         engine.save_state(DEPLOY_DIR)
 
     unlab_df = pd.read_csv(UNLABELED_POOL_PATH)
@@ -407,20 +577,47 @@ async def lifespan(app: FastAPI):
         else:
             unlab_df["chemical_formulas"] = [f"Alloy-{i + 1}" for i in range(len(unlab_df))]
 
+    unlab_df["chemical_formulas"] = unlab_df["chemical_formulas"].apply(_normalize_formula)
+
+    if unlab_df["chemical_formulas"].nunique() < 100:
+        try:
+            unlab_df = _auto_inject_real_uci_formulas(unlab_df, X_train_clean, y_train, feature_cols)
+        except Exception as exc:
+            print(f"[Formula Auto-Align Error] {exc}")
+
+    if (
+        unlab_df["chemical_formulas"].nunique() > 100
+        and os.path.exists(TRAIN_FORMULAS_PATH)
+        and len(X_train_clean) > 50
+    ):
+        try:
+            train_meta = pd.read_csv(TRAIN_FORMULAS_PATH, index_col=0)
+            oracle_synthesized = set(
+                train_meta["chemical_formulas"].iloc[50:].apply(_normalize_formula).tolist()
+            )
+            if oracle_synthesized:
+                unlab_df = unlab_df[~unlab_df["chemical_formulas"].isin(oracle_synthesized)].copy()
+        except Exception as exc:
+            print(f"[Lifespan Notice] Could not filter prior oracle formulas: {exc}")
+
     if "status" not in unlab_df.columns:
         unlab_df["status"] = "unlabeled"
+    else:
+        unlab_df["status"] = unlab_df["status"].fillna("unlabeled").astype(str)
 
     app_state["Engine"] = engine
-    app_state["X_train"] = X_train
+    app_state["X_train"] = X_train_clean
     app_state["y_train"] = y_train
     app_state["feature_cols"] = feature_cols
     app_state["unlabelled"] = unlab_df
-    app_state["iteration"] = max(1, len(X_train) - 50)
+    app_state["iteration"] = max(1, len(X_train_clean) - 50)
+    app_state["kappa"] = 1.96
 
-    _recompute_pool_and_metrics()
+    _recompute_pool_and_metrics(kappa=app_state["kappa"])
     print(
-        f"Ready: {len(X_train)} labeled samples, {len(unlab_df)} unlabeled candidates, "
-        f"{len(app_state['cached_candidates'])} top UCB candidates cached."
+        f"Ready: {len(X_train_clean)} labeled samples, {len(unlab_df)} unlabeled rows "
+        f"({unlab_df['chemical_formulas'].nunique()} unique formulas), "
+        f"{len(app_state['cached_candidates'])} top unique candidates cached."
     )
     yield
     app_state.clear()
@@ -428,11 +625,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Superconductor Digital Triage Workbench API",
-    version="3.0.0",
+    version="3.5.0",
     lifespan=lifespan,
 )
 
-# Permit localhost:3000, localhost:3001, 127.0.0.1, and local network dev hosts
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -451,20 +647,22 @@ app.add_middleware(
 # --- Endpoints ---
 
 @app.get("/candidates", response_model=List[CandidateSchema])
-def get_top_candidates(limit: int = Query(default=200, ge=1, le=2000)):
-    """Returns the top-ranked candidates sorted by descending UCB score."""
+def get_top_candidates(
+    limit: int = Query(default=200, ge=1, le=2000),
+    kappa: Optional[float] = Query(default=None, ge=0.1, le=10.0),
+):
+    if kappa is not None and abs(kappa - float(app_state.get("kappa", 1.96))) > 1e-4:
+        app_state["kappa"] = float(kappa)
+        # Fast O(N log N) UCB re-sort using cached GP posterior
+        _rank_candidates_by_ucb(kappa=float(kappa))
+
     cached = app_state.get("cached_candidates", [])
     return cached[:limit]
 
 
 @app.get("/structure/{formula}", response_model=List[PolymorphSchema])
 def get_crystal_structure(formula: str):
-    """
-    Queries Materials Project for crystal polymorphs matching `formula` and maps them
-    to the exact frontend Polymorph interface, falling back to prototype structures
-    when MP_API_KEY is unset or when the formula has fractional doping.
-    """
-    clean_formula = unquote(formula).strip()
+    clean_formula = _normalize_formula(unquote(formula))
     api_key = os.getenv("MP_API_KEY", "").strip()
     has_fractional_doping = bool(re.search(r"\d+\.\d+", clean_formula))
 
@@ -520,6 +718,13 @@ def get_crystal_structure(formula: str):
             raw_cs = getattr(sym, "crystal_system", "triclinic") if sym else "triclinic"
             crystal_system = str(getattr(raw_cs, "value", raw_cs)).lower()
 
+            a_val = max(0.5, _clean_float(lat.a, 3.85, 3))
+            b_val = max(0.5, _clean_float(lat.b, 3.85, 3))
+            c_val = max(0.5, _clean_float(lat.c, 11.68, 3))
+            alpha_val = min(170.0, max(10.0, _clean_float(lat.alpha, 90.0, 2)))
+            beta_val = min(170.0, max(10.0, _clean_float(lat.beta, 90.0, 2)))
+            gamma_val = min(170.0, max(10.0, _clean_float(lat.gamma, 90.0, 2)))
+
             polymorphs.append({
                 "mp_id": str(doc.material_id),
                 "formula": clean_formula,
@@ -531,13 +736,13 @@ def get_crystal_structure(formula: str):
                 "energy_above_hull": _clean_float(getattr(doc, "energy_above_hull", 0.0), 0.0, 4),
                 "formation_energy_per_atom": _clean_float(getattr(doc, "formation_energy_per_atom", 0.0), 0.0, 4),
                 "lattice": {
-                    "a": _clean_float(lat.a, 3.85, 3),
-                    "b": _clean_float(lat.b, 3.85, 3),
-                    "c": _clean_float(lat.c, 11.68, 3),
-                    "alpha": _clean_float(lat.alpha, 90.0, 2),
-                    "beta": _clean_float(lat.beta, 90.0, 2),
-                    "gamma": _clean_float(lat.gamma, 90.0, 2),
-                    "volume": _clean_float(lat.volume, 173.0, 2),
+                    "a": a_val,
+                    "b": b_val,
+                    "c": c_val,
+                    "alpha": alpha_val,
+                    "beta": beta_val,
+                    "gamma": gamma_val,
+                    "volume": max(1.0, _clean_float(lat.volume, 173.0, 2)),
                 },
                 "sites": sites,
             })
@@ -552,10 +757,6 @@ def get_crystal_structure(formula: str):
 
 @app.post("/oracle", response_model=OracleResponse)
 def submit_lab_result(result: OraclePayload):
-    """
-    Appends experimental Tc measurement to the GP training set, retrains the Matern
-    Gaussian Process, updates cached UCB rankings, and persists artifacts to `deployment/`.
-    """
     engine: ActiveLearningEngine = app_state["Engine"]
     X_train: pd.DataFrame = app_state["X_train"]
     y_train: pd.Series = app_state["y_train"]
@@ -565,53 +766,73 @@ def submit_lab_result(result: OraclePayload):
     cid = int(result.candidate_id)
     if cid in unlab_df.index:
         candidate_row = unlab_df.loc[[cid]].copy()
-        drop_label = cid
     elif 0 <= cid < len(unlab_df):
         candidate_row = unlab_df.iloc[[cid]].copy()
-        drop_label = unlab_df.index[cid]
     else:
         raise HTTPException(status_code=404, detail=f"Candidate ID {cid} not found in unlabeled pool.")
 
-    formula_name = str(candidate_row["chemical_formulas"].iloc[0])
+    formula_name = _normalize_formula(candidate_row["chemical_formulas"].iloc[0])
+
+    next_train_idx = int(X_train.index.max()) + 1 if len(X_train) > 0 else 0
     X_new = (
         candidate_row.reindex(columns=feature_cols, fill_value=0.0)
         .apply(pd.to_numeric, errors="coerce")
         .fillna(0.0)
     )
-    y_new = pd.Series([float(result.true_tc)], index=X_new.index, name=y_train.name or "critical_temp")
+    X_new.index = pd.Index([next_train_idx])
+    y_new = pd.Series(
+        [float(result.true_tc)],
+        index=pd.Index([next_train_idx]),
+        name=y_train.name or "critical_temp",
+    )
 
     X_train_updated = pd.concat([X_train, X_new])
     y_train_updated = pd.concat([y_train, y_new])
 
     engine.Fit(X_train_updated, y_train_updated)
 
+    if unlab_df["chemical_formulas"].nunique() > 100:
+        keep_mask = (unlab_df.index != candidate_row.index[0]) & (
+            unlab_df["chemical_formulas"] != formula_name
+        )
+    else:
+        keep_mask = unlab_df.index != candidate_row.index[0]
+
     app_state["X_train"] = X_train_updated
     app_state["y_train"] = y_train_updated
-    app_state["unlabelled"] = unlab_df.drop(index=drop_label)
+    app_state["unlabelled"] = unlab_df.loc[keep_mask].copy()
     app_state["iteration"] = int(app_state.get("iteration", 1)) + 1
 
-    # Persist updated model and training states to absolute deployment directory
     engine.save_state(DEPLOY_DIR)
     X_train_updated.to_csv(os.path.join(DEPLOY_DIR, "X_train_state.csv"))
     y_train_updated.to_csv(os.path.join(DEPLOY_DIR, "y_train_state.csv"))
 
-    _recompute_pool_and_metrics()
+    if os.path.exists(TRAIN_FORMULAS_PATH):
+        try:
+            train_meta = pd.read_csv(TRAIN_FORMULAS_PATH, index_col=0)
+            new_meta = pd.DataFrame(
+                {"chemical_formulas": [formula_name], "critical_temp": [float(result.true_tc)]},
+                index=pd.Index([next_train_idx]),
+            )
+            pd.concat([train_meta, new_meta]).to_csv(TRAIN_FORMULAS_PATH)
+        except Exception as exc:
+            print(f"[Oracle Metadata Warning] {exc}")
+
+    _recompute_pool_and_metrics(kappa=float(app_state.get("kappa", 1.96)))
 
     return {
         "status": "success",
-        "message": f"Retrained GP with {formula_name} (Tc = {result.true_tc:.1f} K). Iteration #{app_state['iteration']}.",
+        "message": f"Retrained PLS+GP with {formula_name} (Tc = {result.true_tc:.1f} K). Iteration #{app_state['iteration']}.",
     }
 
 
 @app.get("/analytics", response_model=ModelMetricsSchema)
 def get_model_analytics():
-    """Returns Gaussian Process diagnostics, MAE/RMSE, kernel params, and permutation importances."""
     return app_state["cached_analytics"]
 
 
 @app.post("/upload")
 async def upload_candidates_csv(file: UploadFile = File(...)):
-    """Ingests a featurized CSV dataset into the unlabeled pool and recomputes UCB scores."""
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a .csv file.")
 
@@ -630,10 +851,17 @@ async def upload_candidates_csv(file: UploadFile = File(...)):
                 detail="CSV must include a 'chemical_formulas' or 'formula' column.",
             )
 
+    df_new["chemical_formulas"] = df_new["chemical_formulas"].apply(_normalize_formula)
+    if "status" not in df_new.columns:
+        df_new["status"] = "unlabeled"
+    else:
+        df_new["status"] = df_new["status"].fillna("unlabeled").astype(str)
+
     unlab_df: pd.DataFrame = app_state["unlabelled"]
     combined = pd.concat([unlab_df, df_new], ignore_index=True)
+    combined["status"] = combined["status"].fillna("unlabeled").astype(str)
     app_state["unlabelled"] = combined
-    _recompute_pool_and_metrics()
+    _recompute_pool_and_metrics(kappa=float(app_state.get("kappa", 1.96)))
 
     return {
         "status": "success",
@@ -644,7 +872,6 @@ async def upload_candidates_csv(file: UploadFile = File(...)):
 
 @app.get("/export")
 def export_candidates_csv():
-    """Streams the current top-ranked candidates as a downloadable CSV."""
     candidates = app_state.get("cached_candidates", [])
     rows = [
         {
